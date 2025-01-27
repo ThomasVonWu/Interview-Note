@@ -23,7 +23,9 @@ class SelfAttention(nn.Module):
 
         self.register_buffer(
             "mask",
-            torch.trill(torch.ones(block_size)).view(1, 1, block_size, block_size),
+            torch.tril(torch.ones(block_size, block_size)).view(
+                1, 1, block_size, block_size
+            ),
         )  # (bs,1,block_size, block_size) block_size代表的是模型处理的最大长度
 
     def forward(self, x):
@@ -66,7 +68,9 @@ class CausalSelfAttention(nn.Module):
 
         self.register_buffer(
             "mask",
-            torch.trill(torch.ones(block_size)).view(1, 1, block_size, block_size),
+            torch.tril(torch.ones(block_size, block_size)).view(
+                1, 1, block_size, block_size
+            ),
         )  # (bs,1,block_size, block_size) block_size代表的是模型处理的最大长度
 
     def forward(self, x, cache: Tuple[torch.tensor, torch.tensor]):
