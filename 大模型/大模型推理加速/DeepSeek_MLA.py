@@ -498,7 +498,9 @@ class ModelArgs:
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
-    # yarn
+    # yarn（Yet another RoPE extensioN）
+    # 是通过一种高效的计算方法来扩展模型的上下文窗口，比以前的方法减少10倍
+    # 的令牌和2.5倍的训练步骤。它引入了一个ramp函数，并将该函数合并到方法依赖函数中.
     original_seq_len: int = 4096
     rope_theta: float = 10000.0
     rope_factor: float = 40
