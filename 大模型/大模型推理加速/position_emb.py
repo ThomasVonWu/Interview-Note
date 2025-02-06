@@ -1,4 +1,10 @@
 # 手撕绝对位置编码
+"""
+
+待实现
+yarn rope (ref deepseekv3) / ntk rope (https://zhuanlan.zhihu.com/p/675243992)
+平替版alibi (ref https://github.com/ofirpress/attention_with_linear_biases/blob/master/fairseq/models/transformer.py#L1011)
+"""
 import math
 import torch
 import torch.nn as nn
@@ -243,6 +249,99 @@ def test_rope_consistency():
     print(err)
 
 
+class ALiBiPE(nn.Module):
+    """复现源代码中ALiBi相对位置编码
+    这里假设了QK的seq_len 长度一致
+    """
+
+    def __init__(self, n_heads: int, max_seq_len: int):
+        super().__init__()
+        self.n_heads = n_heads
+        self.max_seq_len = max_seq_len
+        self.get_slopes()
+        self.get_biases()
+
+    def get_slopes(
+        self,
+    ) -> torch.Tensor:
+        """
+        生成每个注意力头的斜率参数 m
+        Return:
+             (n_heads, )
+        """
+        self.slopes = 2 ** (torch.arange(1, self.n_heads + 1) * (-8 / self.n_heads))
+        print(self.slopes)
+
+    def get_biases(
+        self,
+    ) -> torch.Tensor:
+        """
+        动态生成偏置矩阵:
+        Return:
+            self.bias shape=(1, n_heads, max_seq_len, max_seq_len)
+            self.pos_diff shape=(max_seq_len, max_seq_len) 构造如下：
+            [ 0,  0,  0,  0,  0]
+            [-1,  0,  0,  0,  0]
+            [-2, -1,  0,  0,  0]
+            [-3, -2, -1,  0,  0]
+            [-4, -3, -2, -1,  0]
+        """
+        pos = torch.arange(self.max_seq_len).float()
+        self.pos_diff = torch.arange(self.max_seq_len).view(-1, 1) - torch.arange(
+            self.max_seq_len
+        ).view(1, -1)
+        self.pos_diff = -torch.tril(self.pos_diff)  # (max_seq_len, max_seq_len)
+        self.bias = self.slopes.unsqueeze(-1).unsqueeze(-1) * self.pos_diff.unsqueeze(0)
+        self.bias = self.bias.unsqueeze(0)
+
+    def apply_alibi_attention(
+        self, attn_scores: torch.Tensor, mask_value=1e-6
+    ) -> torch.Tensor:
+        """
+        Apply alibi position encoding mask to attention scores.
+
+        Args:
+            attn_scores (torch.Tensor): Attention scores without softmax of shape (batch_size, n_heads, q_seq_len, k_seq_len).
+
+        Returns:
+            torch.Tensor: The attention scores with alibi mask applied.
+        """
+        q_seq_len = attn_scores.shape[-2]
+        k_seq_len = attn_scores.shape[-1]
+
+        # Apply a mask based on position difference, setting elements below the diagonal to a large negative number (e.g., -1e4)
+
+        causal_mask = torch.triu(
+            torch.ones([self.max_seq_len, self.max_seq_len]), diagonal=1
+        )
+        causal_mask = causal_mask.masked_fill(
+            causal_mask == 1, float("-inf")
+        )  # (max_seq_len, max_seq_len)
+        causal_mask = causal_mask.unsqueeze(0).unsqueeze(
+            0
+        )  # (1, 1, max_seq_len, max_seq_len)
+
+        # alibi_mask needs to be broadcasted to match the attention scores shape (1, 1, seq_len, seq_len)
+        print(self.bias)
+        alibi_mask = causal_mask + self.bias  # (1, n_heads,  max_seq_len, max_seq_len)
+
+        # Apply the mask to the attention scores
+        attn_scores = attn_scores + alibi_mask[:, :, :q_seq_len, :k_seq_len]
+
+        return attn_scores
+
+
+def test_ablibipe():
+    max_seq_len = 5
+    seq_len = 3
+    n_heads = 8
+    atten_scores = torch.randn(1, n_heads, seq_len, seq_len)
+    ablibipe = ALiBiPE(n_heads, max_seq_len)
+    dis = ablibipe.apply_alibi_attention(atten_scores)
+    print(dis)  # (1, n_heads, seq_len, seq_len, n_heads)
+
+
 if __name__ == "__main__":
     test_abspe_consistency()  # tensor(1.9073e-06)
     test_rope_consistency()  # tensor(4.7684e-07)
+    test_ablibipe()
