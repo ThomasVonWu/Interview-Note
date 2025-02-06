@@ -1,2 +1,2 @@
 # Interview-Note
-Share Interview Questions and Summarize Answers
+Sharing interview experiences related to AD Algorithm, LLM, VLM, CUDA, and TensorR.
