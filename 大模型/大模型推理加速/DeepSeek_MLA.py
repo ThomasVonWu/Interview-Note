@@ -316,7 +316,8 @@ class Linear(nn.Module):
         dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
     """
 
-    dtype = torch.bfloat16
+    # dtype = torch.bfloat16 # 后面接上 RMSnorm 类型会跳转float32
+    dtype = torch.float32
 
     def __init__(
         self, in_features: int, out_features: int, bias: bool = False, dtype=None
@@ -421,24 +422,6 @@ class RowParallelLinear(Linear):
         return y
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """
-    Applies rotary positional embeddings to the input tensor.
-
-    Args:
-        x (torch.Tensor): Input tensor with positional embeddings to be applied.
-        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
-
-    Returns:
-        torch.Tensor: Tensor with rotary embeddings applied.
-    """
-    dtype = x.dtype
-    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
-    y = torch.view_as_real(x * freqs_cis).flatten(3)
-    return y.to(dtype)
-
-
 class ModelArgs:
     """
     Data class for defining model arguments and hyperparameters.
@@ -507,6 +490,114 @@ class ModelArgs:
     beta_fast: int = 32
     beta_slow: int = 1
     mscale: float = 0.707
+
+
+def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
+    """
+    Precomputes frequency-based complex exponential values for rotary positional embeddings.
+
+    Args:
+        args (ModelArgs): Model arguments containing positional embedding parameters.
+
+    Returns:
+        torch.Tensor: Precomputed complex exponential values for positional embeddings.
+    """
+    dim = args.qk_rope_head_dim  # 64
+    seqlen = args.max_seq_len  # 4096*4
+    beta_fast = args.beta_fast  # 32
+    beta_slow = args.beta_slow  # 1
+    base = args.rope_theta  # 10000.0
+    factor = args.rope_factor  # 40.0
+
+    def find_correction_dim(num_rotations, dim, base, max_seq_len):
+        """
+        Computes the correction dimension for a given number of rotations in the rotary positional embedding.
+
+        Args:
+            num_rotations (float): Number of rotations to compute the correction for.
+            dim (int): Dimensionality of the embedding space.
+            base (float): Base value for the exponential computation.
+            max_seq_len (int): Maximum sequence length.
+
+        Returns:
+            float: The correction dimension based on the input parameters.
+        """
+        return (
+            dim
+            * math.log(max_seq_len / (num_rotations * 2 * math.pi))
+            / (2 * math.log(base))
+        )
+
+    def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
+        """
+        Computes the range of correction dimensions for rotary positional embeddings.
+
+        Args:
+            low_rot (float): Lower bound for the number of rotations.
+            high_rot (float): Upper bound for the number of rotations.
+            dim (int): Dimensionality of the embedding space.
+            base (float): Base value for the exponential computation.
+            max_seq_len (int): Maximum sequence length.
+
+        Returns:
+            Tuple[int, int]: The range of correction dimensions (low, high), clamped to valid indices.
+        """
+        low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
+        high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
+        return max(low, 0), min(high, dim - 1)
+
+    def linear_ramp_factor(min, max, dim):
+        """
+        Computes a linear ramp function used to smooth values between a minimum and maximum range.
+
+        Args:
+            min (float): Minimum value for the ramp function.
+            max (float): Maximum value for the ramp function.
+            dim (int): Dimensionality of the ramp tensor.
+
+        Returns:
+            torch.Tensor: A tensor of shape (dim,) with values linearly interpolated between 0 and 1,
+                clamped to the range [0, 1].
+        """
+        if min == max:
+            max += 0.001
+        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+        ramp_func = torch.clamp(linear_func, 0, 1)
+        return ramp_func
+
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    if seqlen > args.original_seq_len:
+        low, high = find_correction_range(
+            beta_fast, beta_slow, dim, base, args.original_seq_len
+        )
+        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+
+    t = torch.arange(seqlen)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # (max_seq_len,  dim // 2)
+    return freqs_cis
+
+
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """
+    Applies rotary positional embeddings to the input tensor.
+
+    Args:
+        x (torch.Tensor): Input tensor with positional embeddings to be applied. (bs, seq_len, num_heads, dim)
+        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
+
+    Returns:
+        torch.Tensor: Tensor with rotary embeddings applied.
+    """
+    dtype = x.dtype
+    # (2, 100, 16, 64) => (2, 100, 16, 32, 2) => (2, 100, 16, 32)
+    x = torch.view_as_complex(
+        x.float().view(*x.shape[:-1], -1, 2)
+    )  
+    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+    y = torch.view_as_real(x * freqs_cis).flatten(3)
+    return y.to(dtype)
 
 
 # Ref: https://github.com/deepseek-ai/DeepSeek-V3/blob/b5d872ead062c94b852d75ce41ae0b10fcfa1c86/inference/model.py#L393
@@ -624,11 +715,15 @@ class MLA(nn.Module):
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+            q = self.wq_b(
+                self.q_norm(self.wq_a(x))
+            )  # bs,s,d=2048 => bs,s,d_c=128 => bs,s,d'=16*192
+        q = q.view(
+            bsz, seqlen, self.n_local_heads, self.qk_head_dim
+        )  # (bs, s, 16, 192)
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
+        )  # (2, 100, 16, 192) => (2, 100, 16, 128),  (2, 100, 16, 64)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
         kv = self.wkv_a(x)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -699,13 +794,29 @@ def test_RMSNorm_consistency():
 
 
 if __name__ == "__main__":
-    test_RMSNorm_consistency()
+    # test_RMSNorm_consistency()
 
-    args  = ModelArgs
-    args.q_lora_rank=128  # 0->128
-    args.kv_lora_rank = 64 # 512
-    args.qk_nope_head_dim = 256 # 128
-    args.qk_rope_head_dim = 48
-    args.max_seq_len = 512 # 4096*4
+    args = ModelArgs
+    # args.dim = 4096
+    args.q_lora_rank = 128  # 0->128
+    # args.kv_lora_rank = 64  # 512
+    # args.qk_nope_head_dim = 256  # 128
+    # args.qk_rope_head_dim = 48
+    # args.max_seq_len = 4096 * 4
 
-    x = torch.randn(4, 100, 4096)
+    bs = 2
+    seq_len = 100
+    d = args.dim  # 2048
+    x = torch.randn(bs, seq_len, d)
+
+    attn_norm = RMSNorm(args.dim)
+    x = attn_norm(x)  # (bs, seq_len, c) => (bs, seq_len, c)
+
+    start_pos = 0
+    mask = None
+    attn = MLA(args)
+
+    freqs_cis = precompute_freqs_cis(args)
+    freqs_cis = freqs_cis[start_pos:start_pos+seq_len]
+    # x = x.to(torch.bfloat16)
+    x = attn(x, start_pos, freqs_cis, mask=mask)
