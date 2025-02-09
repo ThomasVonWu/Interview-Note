@@ -585,16 +585,14 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
     Args:
         x (torch.Tensor): Input tensor with positional embeddings to be applied. (bs, seq_len, num_heads, dim)
-        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings.
+        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings. (seq_len, dim//2)
 
     Returns:
         torch.Tensor: Tensor with rotary embeddings applied.
     """
     dtype = x.dtype
     # (2, 100, 16, 64) => (2, 100, 16, 32, 2) => (2, 100, 16, 32)
-    x = torch.view_as_complex(
-        x.float().view(*x.shape[:-1], -1, 2)
-    )  
+    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
     freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
     y = torch.view_as_real(x * freqs_cis).flatten(3)
     return y.to(dtype)
@@ -640,17 +638,21 @@ class MLA(nn.Module):
         if self.q_lora_rank == 0:
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
         else:
-            self.wq_a = Linear(self.dim, self.q_lora_rank)
+            self.wq_a = Linear(self.dim, self.q_lora_rank)  # 7168 -> 128
             self.q_norm = RMSNorm(self.q_lora_rank)
             self.wq_b = ColumnParallelLinear(
                 self.q_lora_rank, self.n_heads * self.qk_head_dim
-            )
-        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
+            )  # 1536 -> 128*192=24576
+        self.wkv_a = Linear(
+            self.dim, self.kv_lora_rank + self.qk_rope_head_dim
+        )  # 7168 -> 512+64=576
         self.kv_norm = RMSNorm(self.kv_lora_rank)
         self.wkv_b = ColumnParallelLinear(
             self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim)
-        )
-        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+        )  # 512 => 128*(128+128)=32768
+        self.wo = RowParallelLinear(
+            self.n_heads * self.v_head_dim, self.dim
+        )  # 16 * 128 -> 7168
         self.softmax_scale = self.qk_head_dim**-0.5
         if args.max_seq_len > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
@@ -703,7 +705,7 @@ class MLA(nn.Module):
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
-            start_pos (int): Starting position in the sequence for caching.
+            start_pos (int): Starting position in the sequence for caching. (seq_len, d//2)
             freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
             mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
 
@@ -717,18 +719,24 @@ class MLA(nn.Module):
         else:
             q = self.wq_b(
                 self.q_norm(self.wq_a(x))
-            )  # bs,s,d=2048 => bs,s,d_c=128 => bs,s,d'=16*192
+            )  # bs,s,d=7168 => bs,s,d_c=1536 => bs,s,d'=128*192=24576
         q = q.view(
             bsz, seqlen, self.n_local_heads, self.qk_head_dim
-        )  # (bs, s, 16, 192)
+        )  # (bs, s, 128, 192)
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )  # (2, 100, 16, 192) => (2, 100, 16, 128),  (2, 100, 16, 64)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        kv = self.wkv_a(x)
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
-        if attn_impl == "naive":
+        )  # (2, 100, 128, 192) => (2, 100, 128, 128),  (2, 100, 128, 64)
+        q_pe = apply_rotary_emb(
+            q_pe, freqs_cis
+        )  #  (2, 100, 128, 64) | (100,32) => (2, 100, 128, 64)
+        kv = self.wkv_a(x)  # (2,100, 7168) =>  (2,100,512+64=576)
+        kv, k_pe = torch.split(
+            kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )  # (2,100,576) => (2,100,512) | (2,100,64)
+        k_pe = apply_rotary_emb(
+            k_pe.unsqueeze(2), freqs_cis
+        )  # (2,100,1,64) @ (100, 32)
+        if attn_impl == "naive":  # 传统方法
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(self.kv_norm(kv))
             kv = kv.view(
@@ -750,12 +758,20 @@ class MLA(nn.Module):
                 if self.wkv_b.scale is None
                 else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
             )
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+            wkv_b = wkv_b.view(
+                self.n_local_heads, -1, self.kv_lora_rank
+            )  # (32768,512) => (128,256,512)
             q_nope = torch.einsum(
                 "bshd,hdc->bshc", q_nope, wkv_b[:, : self.qk_nope_head_dim]
-            )
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            )  # (2, 100, 128, 128) @ (128, 128, 512) => (2, 100, 128,  512)
+            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(
+                kv
+            )  # (2,100,512) palce into (8,16384,512)
+            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(
+                2
+            )  # (2,100, 64)  palce into (8,16384,64)
+            # (2,100,128,512) @ (2,100,512) => (2,100,128,100)
+            # (2,100,128,64) @ (2,100,64) => (2,100,128,64)
             scores = (
                 torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos])
                 + torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
@@ -797,16 +813,13 @@ if __name__ == "__main__":
     # test_RMSNorm_consistency()
 
     args = ModelArgs
-    # args.dim = 4096
-    args.q_lora_rank = 128  # 0->128
-    # args.kv_lora_rank = 64  # 512
-    # args.qk_nope_head_dim = 256  # 128
-    # args.qk_rope_head_dim = 48
-    # args.max_seq_len = 4096 * 4
+    args.dim = 7168
+    args.q_lora_rank = 1536
+    args.n_heads = 128
 
     bs = 2
     seq_len = 100
-    d = args.dim  # 2048
+    d = args.dim  # 7168
     x = torch.randn(bs, seq_len, d)
 
     attn_norm = RMSNorm(args.dim)
@@ -817,6 +830,10 @@ if __name__ == "__main__":
     attn = MLA(args)
 
     freqs_cis = precompute_freqs_cis(args)
-    freqs_cis = freqs_cis[start_pos:start_pos+seq_len]
+    freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
     # x = x.to(torch.bfloat16)
     x = attn(x, start_pos, freqs_cis, mask=mask)
+
+# REF
+https://www.zhihu.com/search?type=content&q=mla%20%E5%8E%9F%E7%90%86
+DeepSeek-V3 Technical Report
