@@ -200,6 +200,9 @@ class MyRoPE(nn.Module):
         self.freqs_cis = torch.outer(pos, freqs)  # (max_seq_len, d // 2)
 
     def apply_rotary_emb(self, x: torch.FloatTensor):
+        """
+        x : q/k shape(b,s,d)
+        """
         pos_emb = (
             torch.stack([torch.sin(self.freqs_cis), torch.cos(self.freqs_cis)], dim=-1)
             .float()
