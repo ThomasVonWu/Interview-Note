@@ -83,6 +83,7 @@ class CausalSelfAttention(nn.Module):
             pk, pv = cache
             k = torch.cat([pk, k], dim=-2)  # (bs, seq_len' + seq_len, c)
             v = torch.cat([pv, v], dim=-2)  # (bs, seq_len' + seq_len, c)
+            cache = (k, v)
         kv_seq_len = k.shape[-2]
 
         # 变更点2
