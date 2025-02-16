@@ -1,6 +1,11 @@
-#  MLA原理是什么，手撕实现代码
-""" RMSNorm相比较LayerNorm有什么优势? 原理是什么, 手撕源码:
+"""
+Q1) RMSNorm相比较LayerNorm有什么优势? 原理是什么, 手撕源码
+Q2) MLA原理? 核心点介绍, 手撕源码
 path: 大模型系列/大模型推理考核点.md
+
+执行指令：
+cd /path/to/DeepSeek_MLA.py
+python DeepSeek_MLA.py
 """
 import math
 
