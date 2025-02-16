@@ -1,4 +1,8 @@
 """
+参考源代码:
+repository: https://github.com/deepseek-ai/DeepSeek-V3
+commit id : b5d872ead062c94b852d75ce41ae0b10fcfa1c86
+
 Q1) RMSNorm相比较LayerNorm有什么优势? 原理是什么, 手撕源码
 Q2) MLA原理? 核心点介绍, 手撕源码
 path: 大模型系列/大模型推理考核点.md
@@ -7,6 +11,7 @@ path: 大模型系列/大模型推理考核点.md
 cd /path/to/DeepSeek_MLA.py
 python DeepSeek_MLA.py
 """
+
 import math
 
 import torch
