@@ -638,7 +638,7 @@ class MLA(nn.Module):
         if self.q_lora_rank == 0:
             self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
         else:
-            self.wq_a = Linear(self.dim, self.q_lora_rank)  # 7168 -> 128
+            self.wq_a = Linear(self.dim, self.q_lora_rank)  # 7168 -> 1536
             self.q_norm = RMSNorm(self.q_lora_rank)
             self.wq_b = ColumnParallelLinear(
                 self.q_lora_rank, self.n_heads * self.qk_head_dim
@@ -652,8 +652,9 @@ class MLA(nn.Module):
         )  # 512 => 128*(128+128)=32768
         self.wo = RowParallelLinear(
             self.n_heads * self.v_head_dim, self.dim
-        )  # 16 * 128 -> 7168
-        self.softmax_scale = self.qk_head_dim**-0.5
+        )  # 128 * 128 -> 7168
+        self.softmax_scale = self.qk_head_dim**-0.5  # 1/sqrt(128+64)
+        # 需要注意的是，如果推理的序列大于训练的序列长度，需要动态调整softmax_scale
         if args.max_seq_len > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
@@ -680,11 +681,13 @@ class MLA(nn.Module):
                 persistent=False,
             )
         else:
+            # self.kv_cache预设一个大一点的全零张量(8,16384,512)
             self.register_buffer(
                 "kv_cache",
                 torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank),
                 persistent=False,
             )
+            # self.pe_cache预设一个大一点的全零张量(8,16384,64)
             self.register_buffer(
                 "pe_cache",
                 torch.zeros(
@@ -704,8 +707,10 @@ class MLA(nn.Module):
         Forward pass for the Multi-Headed Attention Layer (MLA).
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
-            start_pos (int): Starting position in the sequence for caching. (seq_len, d//2)
+            x (torch.Tensor): Input tensor of shape (batch_size=2, seq_len=1, dim=7168).
+            start_pos (int): Starting position in the sequence for caching. (seq_len, d//2).
+                                         KV cache 起始填充位置以通过：推理过程中记录上一个预
+                                         测的token生成KV填充至KV cache lists的结束的位置end_pos计算得到。
             freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
             mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
 
@@ -719,23 +724,21 @@ class MLA(nn.Module):
         else:
             q = self.wq_b(
                 self.q_norm(self.wq_a(x))
-            )  # bs,s,d=7168 => bs,s,d_c=1536 => bs,s,d'=128*192=24576
-        q = q.view(
-            bsz, seqlen, self.n_local_heads, self.qk_head_dim
-        )  # (bs, s, 128, 192)
+            )  # b,s,d=7168 => b,s,d_c=1536 => b,s,nh*dh=128*192=24576
+        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)  # b, s, 128, 192
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )  # (2, 100, 128, 192) => (2, 100, 128, 128),  (2, 100, 128, 64)
+        )  # (2, 1, 128, 192) => (2, 1, 128, 128),  (2, 1, 128, 64)
         q_pe = apply_rotary_emb(
             q_pe, freqs_cis
-        )  #  (2, 100, 128, 64) | (100,32) => (2, 100, 128, 64)
-        kv = self.wkv_a(x)  # (2,100, 7168) =>  (2,100,512+64=576)
+        )  #  (2, 1, 128, 64) | (1,32) => (2, 1, 128, 64)
+        kv = self.wkv_a(x)  # (2,1, 7168) =>  (2,1,512+64=576)
         kv, k_pe = torch.split(
             kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )  # (2,100,576) => (2,100,512) | (2,100,64)
+        )  # (2,1,576) => (2,1,512), (2,1,64)
         k_pe = apply_rotary_emb(
             k_pe.unsqueeze(2), freqs_cis
-        )  # (2,100,1,64) @ (100, 32)
+        )  # apply((2,1,1,64)  | (1, 32))
         if attn_impl == "naive":  # 传统方法
             q = torch.cat([q_nope, q_pe], dim=-1)
             kv = self.wkv_b(self.kv_norm(kv))
@@ -760,18 +763,18 @@ class MLA(nn.Module):
             )
             wkv_b = wkv_b.view(
                 self.n_local_heads, -1, self.kv_lora_rank
-            )  # (32768,512) => (128,256,512)
+            )  # (128*(128+128),512) => (128,256,512)
             q_nope = torch.einsum(
                 "bshd,hdc->bshc", q_nope, wkv_b[:, : self.qk_nope_head_dim]
-            )  # (2, 100, 128, 128) @ (128, 128, 512) => (2, 100, 128,  512)
+            )  # (2,1,128,128) einsum (128,128,512) => (2,1,128,512)
             self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(
                 kv
-            )  # (2,100,512) palce into (8,16384,512)
+            )  # (2,1,512) palce into (:2,0:1,512)
             self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(
                 2
-            )  # (2,100, 64)  palce into (8,16384,64)
-            # (2,100,128,512) @ (2,100,512) => (2,100,128,100)
-            # (2,100,128,64) @ (2,100,64) => (2,100,128,64)
+            )  # (2,1,64)  palce into (:2,0:1,64)
+            # (2,1,128,512) einsum (2,1,512) => (2,1,128,1)
+            # (2,1,128,64) einsum (2,1,64) => (2,1,128,64)
             scores = (
                 torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos])
                 + torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
@@ -782,8 +785,12 @@ class MLA(nn.Module):
         if attn_impl == "naive":
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
         else:
-            x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :])
+            x = torch.einsum(
+                "bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos]
+            )  # (2, 1, 128, 512)
+            x = torch.einsum(
+                "bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :]
+            )  #  (2, 1, 128, 512) (128,-128:,512) -> (2,1,128,128)
         x = self.wo(x.flatten(2))
         return x
 
@@ -793,7 +800,7 @@ def test_RMSNorm_consistency():
     seq_len = 10
     dim = 64
 
-    torch.manual_seed(100)
+    torch.manual_seed(1)
     x = torch.randn(batch_size, seq_len, dim)
 
     my_rmsnorm = MyRMSNorm(hidden_size=dim)
@@ -809,8 +816,35 @@ def test_RMSNorm_consistency():
     print("max_error=", max_error)
 
 
+def test_einsum_with_torchmat_consistency():
+    # 输入张量
+    b, s, h, c = 2, 1, 128, 512  # 示例维度
+    t = 1  # 目标序列长度
+    q_nope = torch.randn(b, s, h, c)
+    kv_cache = torch.randn(b, t, c)
+
+    # 1. 合并 s 和 h 维度
+    q_reshaped = q_nope.view(b, s * h, c)  # shape: (b, s*h, c)
+
+    # 2. 转置 kv_cache 到 (b, c, t)
+    kv_transposed = kv_cache.transpose(1, 2)  # shape: (b, c, t)
+
+    # 3. 批量矩阵乘法 (b, s*h, c) @ (b, c, t) -> (b, s*h, t)
+    scores = torch.bmm(q_reshaped, kv_transposed)  # shape: (b, s*h, t)
+
+    # 4. 恢复为 (b, s, h, t)
+    scores = scores.view(b, s, h, t)  # shape: (b, s, h, t)
+
+    # 使用 einsum 计算
+    scores_einsum = torch.einsum("bshc,btc->bsht", q_nope, kv_cache)
+
+    # 检查两种方法的结果是否一致
+    print(torch.allclose(scores, scores_einsum, atol=1e-6))  # 应输出 True
+
+
 if __name__ == "__main__":
-    # test_RMSNorm_consistency()
+    test_RMSNorm_consistency()
+    test_einsum_with_torchmat_consistency()
 
     args = ModelArgs
     args.dim = 7168
@@ -818,22 +852,17 @@ if __name__ == "__main__":
     args.n_heads = 128
 
     bs = 2
-    seq_len = 100
+    seq_len = 1
     d = args.dim  # 7168
     x = torch.randn(bs, seq_len, d)
 
     attn_norm = RMSNorm(args.dim)
-    x = attn_norm(x)  # (bs, seq_len, c) => (bs, seq_len, c)
-
+    x = attn_norm(x)
     start_pos = 0
     mask = None
     attn = MLA(args)
 
     freqs_cis = precompute_freqs_cis(args)
     freqs_cis = freqs_cis[start_pos : start_pos + seq_len]
-    # x = x.to(torch.bfloat16)
     x = attn(x, start_pos, freqs_cis, mask=mask)
-
-# REF
-https://www.zhihu.com/search?type=content&q=mla%20%E5%8E%9F%E7%90%86
-DeepSeek-V3 Technical Report
+    print(x.shape)
