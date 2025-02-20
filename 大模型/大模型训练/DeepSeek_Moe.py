@@ -1,72 +1,26 @@
-"""
-参考源代码:
-repository: https://github.com/deepseek-ai/DeepSeek-V3
-commit id : b5d872ead062c94b852d75ce41ae0b10fcfa1c86
-
-Q1) RMSNorm相比较LayerNorm有什么优势? 原理是什么, 手撕源码
-Q2) MLA原理? 核心点介绍, 手撕源码
-path: 大模型系列/大模型推理考核点.md
-
-执行指令：
-cd /path/to/DeepSeek_MLA.py
-python DeepSeek_MLA.py
-"""
-
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 import triton
 import triton.language as tl
+import torch.distributed as dist
+
 from triton import Config
-
-from typing import Literal, Optional, Tuple
-
-
-class MyRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def _norm(self, x: torch.FloatTensor):
-        # (b, s, c ) / (b, s, 1 ) => (b, s, c )
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x: torch.FloatTensor):
-        return self.weight * self._norm(x)
+from dataclasses import dataclass
+from typing import Tuple, Optional, Literal
 
 
-class RMSNorm(nn.Module):
-    """Official Implementation
-    Root Mean Square Layer Normalization (RMSNorm).
-
-    Args:
-        dim (int): Dimension of the input tensor.
-        eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: torch.Tensor):
-        """
-        Forward pass for RMSNorm.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Normalized tensor with the same shape as input.
-        """
-        return F.rms_norm(x, (self.dim,), self.weight, self.eps)
+fp8_gemm_configs = [
+    Config(
+        {"BLOCK_SIZE_M": block_m, "BLOCK_SIZE_N": block_n, "BLOCK_SIZE_K": 128},
+        num_stages=num_stages,
+        num_warps=8,
+    )
+    for block_m in [16, 32, 64]
+    for block_n in [32, 64, 128]
+    for num_stages in [3, 4, 5, 6]
+]
 
 
 @triton.jit
@@ -326,8 +280,7 @@ class Linear(nn.Module):
         dtype (optional): Data type for the layer. Defaults to `torch.bfloat16`.
     """
 
-    # dtype = torch.bfloat16 # 后面接上 RMSnorm 类型会跳转float32
-    dtype = torch.float32
+    dtype = torch.bfloat16
 
     def __init__(
         self, in_features: int, out_features: int, bias: bool = False, dtype=None
@@ -432,6 +385,7 @@ class RowParallelLinear(Linear):
         return y
 
 
+@dataclass
 class ModelArgs:
     """
     Data class for defining model arguments and hyperparameters.
@@ -491,124 +445,158 @@ class ModelArgs:
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
-    # yarn（Yet another RoPE extensioN）
-    # 是通过一种高效的计算方法来扩展模型的上下文窗口，比以前的方法减少10倍
-    # 的令牌和2.5倍的训练步骤。它引入了一个ramp函数，并将该函数合并到方法依赖函数中.
+    # yarn
     original_seq_len: int = 4096
     rope_theta: float = 10000.0
     rope_factor: float = 40
     beta_fast: int = 32
     beta_slow: int = 1
-    mscale: float = 0.707
+    mscale: float = 1.0
 
 
-def precompute_freqs_cis(args: ModelArgs) -> torch.Tensor:
+class MLP(nn.Module):
     """
-    Precomputes frequency-based complex exponential values for rotary positional embeddings.
+    Multi-Layer Perceptron (MLP) used as a feed-forward layer.
 
-    Args:
-        args (ModelArgs): Model arguments containing positional embedding parameters.
-
-    Returns:
-        torch.Tensor: Precomputed complex exponential values for positional embeddings.
+    Attributes:
+        w1 (nn.Module): Linear layer for input-to-hidden transformation.
+        w2 (nn.Module): Linear layer for hidden-to-output transformation.
+        w3 (nn.Module): Additional linear layer for feature transformation.
     """
-    dim = args.qk_rope_head_dim  # 64
-    seqlen = args.max_seq_len  # 4096*4
-    beta_fast = args.beta_fast  # 32
-    beta_slow = args.beta_slow  # 1
-    base = args.rope_theta  # 10000.0
-    factor = args.rope_factor  # 40.0
 
-    def find_correction_dim(num_rotations, dim, base, max_seq_len):
+    def __init__(self, dim: int, inter_dim: int):
         """
-        Computes the correction dimension for a given number of rotations in the rotary positional embedding.
+        Initializes the MLP layer.
 
         Args:
-            num_rotations (float): Number of rotations to compute the correction for.
-            dim (int): Dimensionality of the embedding space.
-            base (float): Base value for the exponential computation.
-            max_seq_len (int): Maximum sequence length.
+            dim (int): Input and output dimensionality.
+            inter_dim (int): Hidden layer dimensionality.
+        """
+        super().__init__()
+        self.w1 = ColumnParallelLinear(dim, inter_dim)
+        self.w2 = RowParallelLinear(inter_dim, dim)
+        self.w3 = ColumnParallelLinear(dim, inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the MLP layer.
+
+        Args:
+            x (torch.Tensor): Input tensor.
 
         Returns:
-            float: The correction dimension based on the input parameters.
+            torch.Tensor: Output tensor after MLP computation.
         """
-        return (
-            dim
-            * math.log(max_seq_len / (num_rotations * 2 * math.pi))
-            / (2 * math.log(base))
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class Gate(nn.Module):
+    """
+    Gating mechanism for routing inputs in a mixture-of-experts (MoE) model.
+
+    Attributes:
+        dim (int): Dimensionality of input features.
+        topk (int): Number of top experts activated for each input.
+        n_groups (int): Number of groups for routing.
+        topk_groups (int): Number of groups to route inputs to.
+        score_func (str): Scoring function ('softmax' or 'sigmoid').
+        route_scale (float): Scaling factor for routing weights.
+        weight (torch.nn.Parameter): Learnable weights for the gate.
+        bias (Optional[torch.nn.Parameter]): Optional bias term for the gate.
+    """
+
+    def __init__(self, args: ModelArgs):
+        """
+        Initializes the Gate module.
+
+        Args:
+            args (ModelArgs): Model arguments containing gating parameters.
+        """
+        super().__init__()
+        self.dim = args.dim
+        self.topk = args.n_activated_experts
+        self.n_groups = args.n_expert_groups
+        self.topk_groups = args.n_limited_groups
+        self.score_func = args.score_func
+        self.route_scale = args.route_scale
+        self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
+        self.bias = (
+            nn.Parameter(torch.empty(args.n_routed_experts))
+            if self.dim == 7168
+            else None
         )
 
-    def find_correction_range(low_rot, high_rot, dim, base, max_seq_len):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Computes the range of correction dimensions for rotary positional embeddings.
+        Forward pass for the gating mechanism.
 
         Args:
-            low_rot (float): Lower bound for the number of rotations.
-            high_rot (float): Upper bound for the number of rotations.
-            dim (int): Dimensionality of the embedding space.
-            base (float): Base value for the exponential computation.
-            max_seq_len (int): Maximum sequence length.
+            x (torch.Tensor): Input tensor.
 
         Returns:
-            Tuple[int, int]: The range of correction dimensions (low, high), clamped to valid indices.
+            Tuple[torch.Tensor, torch.Tensor]: Routing weights and selected expert indices.
         """
-        low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
-        high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
-        return max(low, 0), min(high, dim - 1)
+        scores = linear(x, self.weight)
+        if self.score_func == "softmax":
+            scores = scores.softmax(dim=-1, dtype=torch.float32)
+        else:
+            scores = scores.sigmoid()
+        original_scores = scores
+        if self.bias is not None:
+            scores = scores + self.bias
+        if self.n_groups > 1:
+            scores = scores.view(x.size(0), self.n_groups, -1)
+            if self.bias is None:
+                group_scores = scores.amax(dim=-1)
+            else:
+                group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
+            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
+            mask = torch.zeros_like(scores[..., 0]).scatter_(1, indices, True)
+            scores = (scores * mask.unsqueeze(-1)).flatten(1)
+        indices = torch.topk(scores, self.topk, dim=-1)[1]
+        weights = original_scores.gather(1, indices)
+        if self.score_func == "sigmoid":
+            weights /= weights.sum(dim=-1, keepdim=True)
+        weights *= self.route_scale
+        return weights.type_as(x), indices
 
-    def linear_ramp_factor(min, max, dim):
+
+class Expert(nn.Module):
+    """
+    Expert layer for Mixture-of-Experts (MoE) models.
+
+    Attributes:
+        w1 (nn.Module): Linear layer for input-to-hidden transformation.
+        w2 (nn.Module): Linear layer for hidden-to-output transformation.
+        w3 (nn.Module): Additional linear layer for feature transformation.
+    """
+
+    def __init__(self, dim: int, inter_dim: int):
         """
-        Computes a linear ramp function used to smooth values between a minimum and maximum range.
+        Initializes the Expert layer.
 
         Args:
-            min (float): Minimum value for the ramp function.
-            max (float): Maximum value for the ramp function.
-            dim (int): Dimensionality of the ramp tensor.
+            dim (int): Input and output dimensionality.
+            inter_dim (int): Hidden layer dimensionality.
+        """
+        super().__init__()
+        self.w1 = Linear(dim, inter_dim)
+        self.w2 = Linear(inter_dim, dim)
+        self.w3 = Linear(dim, inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the Expert layer.
+
+        Args:
+            x (torch.Tensor): Input tensor.
 
         Returns:
-            torch.Tensor: A tensor of shape (dim,) with values linearly interpolated between 0 and 1,
-                clamped to the range [0, 1].
+            torch.Tensor: Output tensor after expert computation.
         """
-        if min == max:
-            max += 0.001
-        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
-        ramp_func = torch.clamp(linear_func, 0, 1)
-        return ramp_func
-
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    if seqlen > args.original_seq_len:
-        low, high = find_correction_range(
-            beta_fast, beta_slow, dim, base, args.original_seq_len
-        )
-        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
-        freqs = freqs / factor * (1 - smooth) + freqs * smooth
-
-    t = torch.arange(seqlen)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # (max_seq_len,  dim // 2)
-    return freqs_cis
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    """
-    Applies rotary positional embeddings to the input tensor.
-
-    Args:
-        x (torch.Tensor): Input tensor with positional embeddings to be applied. (bs, seq_len, num_heads, dim)
-        freqs_cis (torch.Tensor): Precomputed complex exponential values for positional embeddings. (seq_len, dim//2)
-
-    Returns:
-        torch.Tensor: Tensor with rotary embeddings applied.
-    """
-    dtype = x.dtype
-    # (2, 100, 16, 64) => (2, 100, 16, 32, 2) => (2, 100, 16, 32)
-    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
-    y = torch.view_as_real(x * freqs_cis).flatten(3)
-    return y.to(dtype)
-
-
-# Ref: https://github.com/deepseek-ai/DeepSeek-V3/blob/b5d872ead062c94b852d75ce41ae0b10fcfa1c86/inference/model.py#L393
 world_size = 1
 rank = 0
 block_size = 128
@@ -616,248 +604,82 @@ gemm_impl: Literal["bf16", "fp8"] = "bf16"
 attn_impl: Literal["naive", "absorb"] = "absorb"
 
 
-class MLA(nn.Module):
+class MoE(nn.Module):
     """
-    Multi-Headed Attention Layer (MLA).
+    Mixture-of-Experts (MoE) module.
 
     Attributes:
-        dim (int): Dimensionality of the input features.
-        n_heads (int): Number of attention heads.
-        n_local_heads (int): Number of local attention heads for distributed systems.
-        q_lora_rank (int): Rank for low-rank query projection.
-        kv_lora_rank (int): Rank for low-rank key/value projection.
-        qk_nope_head_dim (int): Dimensionality of non-positional query/key projections.
-        qk_rope_head_dim (int): Dimensionality of rotary-positional query/key projections.
-        qk_head_dim (int): Total dimensionality of query/key projections.
-        v_head_dim (int): Dimensionality of value projections.
-        softmax_scale (float): Scaling factor for softmax in attention computation.
+        dim (int): Dimensionality of input features.
+        n_routed_experts (int): Total number of experts in the model.
+        n_local_experts (int): Number of experts handled locally in distributed systems.
+        n_activated_experts (int): Number of experts activated for each input.
+        gate (nn.Module): Gating mechanism to route inputs to experts.
+        experts (nn.ModuleList): List of expert modules.
+        shared_experts (nn.Module): Shared experts applied to all inputs.
     """
 
     def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.dim = args.dim
-        self.n_heads = args.n_heads
-        self.n_local_heads = args.n_heads // world_size
-        self.q_lora_rank = args.q_lora_rank
-        self.kv_lora_rank = args.kv_lora_rank
-        self.qk_nope_head_dim = args.qk_nope_head_dim
-        self.qk_rope_head_dim = args.qk_rope_head_dim
-        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
-        self.v_head_dim = args.v_head_dim
-
-        if self.q_lora_rank == 0:
-            self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
-        else:
-            self.wq_a = Linear(self.dim, self.q_lora_rank)  # 7168 -> 1536
-            self.q_norm = RMSNorm(self.q_lora_rank)
-            self.wq_b = ColumnParallelLinear(
-                self.q_lora_rank, self.n_heads * self.qk_head_dim
-            )  # 1536 -> 128*192=24576
-        self.wkv_a = Linear(
-            self.dim, self.kv_lora_rank + self.qk_rope_head_dim
-        )  # 7168 -> 512+64=576
-        self.kv_norm = RMSNorm(self.kv_lora_rank)
-        self.wkv_b = ColumnParallelLinear(
-            self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim)
-        )  # 512 => 128*(128+128)=32768
-        self.wo = RowParallelLinear(
-            self.n_heads * self.v_head_dim, self.dim
-        )  # 128 * 128 -> 7168
-        self.softmax_scale = self.qk_head_dim**-0.5  # 1/sqrt(128+64)
-        # 需要注意的是，如果推理的序列大于训练的序列长度，需要动态调整softmax_scale
-        if args.max_seq_len > args.original_seq_len:
-            mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
-            self.softmax_scale = self.softmax_scale * mscale * mscale
-
-        if attn_impl == "naive":
-            self.register_buffer(
-                "k_cache",
-                torch.zeros(
-                    args.max_batch_size,
-                    args.max_seq_len,
-                    self.n_local_heads,
-                    self.qk_head_dim,
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                "v_cache",
-                torch.zeros(
-                    args.max_batch_size,
-                    args.max_seq_len,
-                    self.n_local_heads,
-                    self.v_head_dim,
-                ),
-                persistent=False,
-            )
-        else:
-            # self.kv_cache预设一个大一点的全零张量(8,16384,512)
-            self.register_buffer(
-                "kv_cache",
-                torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank),
-                persistent=False,
-            )
-            # self.pe_cache预设一个大一点的全零张量(8,16384,64)
-            self.register_buffer(
-                "pe_cache",
-                torch.zeros(
-                    args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim
-                ),
-                persistent=False,
-            )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
-    ):
         """
-        Forward pass for the Multi-Headed Attention Layer (MLA).
+        Initializes the MoE module.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size=2, seq_len=1, dim=7168).
-            start_pos (int): Starting position in the sequence for caching. (seq_len, d//2).
-                                         KV cache 起始填充位置以通过：推理过程中记录上一个预
-                                         测的token生成KV填充至KV cache lists的结束的位置end_pos计算得到。
-            freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
-            mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
+            args (ModelArgs): Model arguments containing MoE parameters.
+        """
+        super().__init__()
+        self.dim = args.dim
+        assert args.n_routed_experts % world_size == 0
+        self.n_routed_experts = args.n_routed_experts
+        self.n_local_experts = args.n_routed_experts // world_size
+        self.n_activated_experts = args.n_activated_experts
+        self.experts_start_idx = rank * self.n_local_experts
+        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        self.gate = Gate(args)
+        self.experts = nn.ModuleList(
+            [
+                (
+                    Expert(args.dim, args.moe_inter_dim)
+                    if self.experts_start_idx <= i < self.experts_end_idx
+                    else None
+                )
+                for i in range(self.n_routed_experts)
+            ]
+        )
+        self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass for the MoE module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
 
         Returns:
-            torch.Tensor: Output tensor with the same shape as the input.
+            torch.Tensor: Output tensor after expert routing and computation.
         """
-        bsz, seqlen, _ = x.size()
-        end_pos = start_pos + seqlen
-        if self.q_lora_rank == 0:
-            q = self.wq(x)
-        else:
-            q = self.wq_b(
-                self.q_norm(self.wq_a(x))
-            )  # b,s,d=7168 => b,s,d_c=1536 => b,s,nh*dh=128*192=24576
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)  # b, s, 128, 192
-        q_nope, q_pe = torch.split(
-            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )  # (2, 1, 128, 192) => (2, 1, 128, 128),  (2, 1, 128, 64)
-        q_pe = apply_rotary_emb(
-            q_pe, freqs_cis
-        )  #  (2, 1, 128, 64) | (1,32) => (2, 1, 128, 64)
-        kv = self.wkv_a(x)  # (2,1, 7168) =>  (2,1,512+64=576)
-        kv, k_pe = torch.split(
-            kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )  # (2,1,576) => (2,1,512), (2,1,64)
-        k_pe = apply_rotary_emb(
-            k_pe.unsqueeze(2), freqs_cis
-        )  # apply((2,1,1,64)  | (1, 32))
-        if attn_impl == "naive":  # 传统方法
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(
-                bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            k_nope, v = torch.split(
-                kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-            )
-            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
-            self.k_cache[:bsz, start_pos:end_pos] = k
-            self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = (
-                torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos])
-                * self.softmax_scale
-            )
-        else:
-            wkv_b = (
-                self.wkv_b.weight
-                if self.wkv_b.scale is None
-                else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
-            )
-            wkv_b = wkv_b.view(
-                self.n_local_heads, -1, self.kv_lora_rank
-            )  # (128*(128+128),512) => (128,256,512)
-            q_nope = torch.einsum(
-                "bshd,hdc->bshc", q_nope, wkv_b[:, : self.qk_nope_head_dim]
-            )  # (2,1,128,128) einsum (128,128,512) => (2,1,128,512)
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(
-                kv
-            )  # (2,1,512) palce into (:2,0:1,512)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(
-                2
-            )  # (2,1,64)  palce into (:2,0:1,64)
-            # (2,1,128,512) einsum (2,1,512) => (2,1,128,1)
-            # (2,1,128,64) einsum (2,1,64) => (2,1,128,1)
-            scores = (
-                torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos])
-                + torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])
-            ) * self.softmax_scale
-        if mask is not None:
-            scores += mask.unsqueeze(1)
-        scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
-        if attn_impl == "naive":
-            x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
-        else:
-            x = torch.einsum(
-                "bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos]
-            )  # (2, 1, 128, 512)
-            x = torch.einsum(
-                "bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim :]
-            )  #  (2, 1, 128, 512) (128,-128:,512) -> (2,1,128,128)
-        x = self.wo(x.flatten(2))
-        return x
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        weights, indices = self.gate(x)
+        y = torch.zeros_like(x)
+        counts = torch.bincount(
+            indices.flatten(), minlength=self.n_routed_experts
+        ).tolist()
+        for i in range(self.experts_start_idx, self.experts_end_idx):
+            if counts[i] == 0:
+                continue
+            expert = self.experts[i]
+            idx, top = torch.where(indices == i)
+            y[idx] += expert(x[idx]) * weights[idx, top, None]
+        z = self.shared_experts(x)
+        if world_size > 1:
+            dist.all_reduce(y)
+        return (y + z).view(shape)
 
-
-def test_RMSNorm_consistency():
-    batch_size = 2
-    seq_len = 10
-    dim = 64
-
-    torch.manual_seed(1)
-    x = torch.randn(batch_size, seq_len, dim)
-
-    my_rmsnorm = MyRMSNorm(hidden_size=dim)
-    rmsnorm = RMSNorm(dim=dim)
-
-    my_rmsnorm.eval()
-    rmsnorm.eval()
-    with torch.no_grad():
-        my_res = my_rmsnorm(x)
-        res = rmsnorm(x)
-        max_error = (my_res - res).abs().max()
-    assert max_error < 1e-3
-    print("max_error=", max_error)
-
-
-def test_einsum_with_torchmat_consistency():
-    # 输入张量
-    b, s, h, c = 2, 1, 128, 512  # 示例维度
-    t = 1  # 目标序列长度
-    q_nope = torch.randn(b, s, h, c)
-    kv_cache = torch.randn(b, t, c)
-
-    # 1. 合并 s 和 h 维度
-    q_reshaped = q_nope.view(b, s * h, c)  # shape: (b, s*h, c)
-
-    # 2. 转置 kv_cache 到 (b, c, t)
-    kv_transposed = kv_cache.transpose(1, 2)  # shape: (b, c, t)
-
-    # 3. 批量矩阵乘法 (b, s*h, c) @ (b, c, t) -> (b, s*h, t)
-    scores = torch.bmm(q_reshaped, kv_transposed)  # shape: (b, s*h, t)
-
-    # 4. 恢复为 (b, s, h, t)
-    scores = scores.view(b, s, h, t)  # shape: (b, s, h, t)
-
-    # 使用 einsum 计算
-    scores_einsum = torch.einsum("bshc,btc->bsht", q_nope, kv_cache)
-
-    # 检查两种方法的结果是否一致
-    print(torch.allclose(scores, scores_einsum, atol=1e-6))  # 应输出 True
 
 
 if __name__ == "__main__":
-    test_RMSNorm_consistency()
-    test_einsum_with_torchmat_consistency()
-
+    
     args = ModelArgs
-    args.dim = 7168
+    args.n_routed_experts = 256 # 路由专家的总数量
     args.q_lora_rank = 1536
     args.n_heads = 128
 
